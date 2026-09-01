@@ -1,0 +1,97 @@
+name: Slugworth 24/7
+
+on:
+  schedule:
+    - cron: "0 */6 * * *"
+  workflow_dispatch:
+  push:
+    branches: [ main ]
+
+permissions:
+  actions: write
+  contents: write
+
+concurrency:
+  group: slugworth-bot-single-instance
+  cancel-in-progress: true
+
+jobs:
+  run-slugworth:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        run: pip install --no-cache-dir discord.py aiohttp aiofiles huggingface-hub google-genai
+
+      - name: Write bot file
+        env:
+          BOT_CODE: ${{ secrets.BOT_CODE_SLUGWORTH }}
+        run: printf '%s\n' "$BOT_CODE" > slugworth_bot.py
+
+      - name: Run Slugworth
+        env:
+          DISCORD_TOKEN:             ${{ secrets.DISCORD_TOKEN_SLUGWORTH }}
+          GEMINI_API_KEY:            ${{ secrets.GEMINI_API_KEY_SLUGWORTH }}
+          HF_MAIN_MULTI_TOKEN:       ${{ secrets.HF_MAIN_MULTI_TOKEN_SLUGWORTH }}
+          HF_SUMM_MULTI_TOKEN:       ${{ secrets.HF_SUMM_MULTI_TOKEN_SLUGWORTH }}
+        run: |
+          [ -z "$DISCORD_TOKEN" ] && { echo "DISCORD_TOKEN missing"; exit 1; }
+
+          python slugworth_bot.py &
+          BOT_PID=$!
+
+          sleep 12
+          kill -0 $BOT_PID 2>/dev/null || { echo "Bot failed to start"; exit 1; }
+          echo "Slugworth running (PID $BOT_PID)"
+
+          trap '
+            kill -TERM $BOT_PID 2>/dev/null || true
+            sleep 5
+            kill -KILL $BOT_PID 2>/dev/null || true
+            wait $BOT_PID 2>/dev/null || true
+            exit 0
+          ' TERM INT
+
+          wait $BOT_PID
+
+      - name: Clean up old runs
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        run: |
+          CURRENT=${{ github.run_id }}
+          echo "Current run: $CURRENT"
+          echo "Cleaning up old Slugworth runs..."
+
+          run_ids=$(gh api --paginate \
+            -H "Accept: application/vnd.github+json" \
+            "/repos/$REPO/actions/workflows/slugworth.yml/runs" \
+            --jq '.workflow_runs[] | select(.status == "completed" or .status == "failure" or .status == "cancelled") | .id')
+
+          if [ -z "$run_ids" ]; then
+            echo "No runs to clean."
+            exit 0
+          fi
+
+          for id in $run_ids; do
+            if [ "$id" = "$CURRENT" ]; then
+              echo "Skipping current run: $id"
+              continue
+            fi
+            echo "Deleting old run: $id"
+            gh api \
+              -X DELETE \
+              -H "Accept: application/vnd.github+json" \
+              "/repos/$REPO/actions/runs/$id" || echo "Failed to delete $id"
+            sleep 0.4
+          done
+
+          echo "Cleanup done"
